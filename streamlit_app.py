@@ -43,8 +43,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 # ---------------------------------------------------------------------------
 
 # Ajuste o nome do modelo conforme disponibilidade na sua conta OpenAI.
-# A especificação cita "GPT-5"; o flagship atual da API é a família GPT-5.5.
-CHAT_MODEL = "gpt-5.5"
+CHAT_MODEL = "gpt-4o"
 EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIM = 1536          # dimensão do text-embedding-3-small
 CHUNK_SIZE = 1200             # caracteres por bloco
