@@ -7,18 +7,34 @@ Plataforma com dois módulos:
   - Módulo 2: Chat Jurídico Inteligente (RAG sobre base de contratos)
 
 Stack: Streamlit + OpenAI + FAISS
+
+------------------------------------------------------------------------------
+NOTA SOBRE O ERRO openai.AuthenticationError (HTTP 401)
+------------------------------------------------------------------------------
+401 significa que a OpenAI REJEITOU a chave usada na chamada. Não é problema de
+modelo (o erro persistiu mesmo após trocar gpt-5.5 -> gpt-4o). Causas comuns:
+
+  1. A chave no Streamlit Secrets tem espaço, aspas extras ou quebra de linha.
+  2. A chave foi revogada / expirou.
+  3. A conta/projeto não tem billing ativo ou crédito.
+  4. A chave é de um projeto sem permissão para o endpoint /chat/completions.
+
+Esta versão NÃO usa cache no cliente (cache pode reter uma chave antiga) e faz
+um teste explícito da credencial no startup, mostrando a causa real em vez da
+mensagem genérica "redacted". Veja a barra lateral ("Diagnóstico").
+------------------------------------------------------------------------------
 """
 
 import io
 import json
-import time
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+import openai
 from openai import OpenAI
 
 # Extração de documentos
@@ -42,7 +58,6 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 # Configuração
 # ---------------------------------------------------------------------------
 
-# Ajuste o nome do modelo conforme disponibilidade na sua conta OpenAI.
 CHAT_MODEL = "gpt-4o"
 EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIM = 1536          # dimensão do text-embedding-3-small
@@ -60,16 +75,86 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
-# Cliente OpenAI
+# Credencial / Cliente OpenAI
 # ---------------------------------------------------------------------------
 
-@st.cache_resource(show_spinner=False)
-def get_client() -> Optional[OpenAI]:
-    """Cria o cliente OpenAI a partir da chave em Streamlit Secrets."""
-    api_key = st.secrets.get("OPENAI_API_KEY", None)
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key)
+def read_api_key() -> Tuple[Optional[str], List[str]]:
+    """
+    Lê a chave dos Secrets e devolve (chave_limpa, avisos).
+    Detecta os problemas de formatação mais comuns que geram 401.
+    """
+    warnings: List[str] = []
+    raw = st.secrets.get("OPENAI_API_KEY", None)
+    if raw is None:
+        return None, ["OPENAI_API_KEY não encontrada em st.secrets."]
+
+    key = str(raw)
+
+    if key != key.strip():
+        warnings.append("A chave tinha espaços ou quebras de linha nas bordas (removidos).")
+    if "\n" in key or "\r" in key:
+        warnings.append("A chave continha quebra de linha no meio (removida).")
+    if key.strip().startswith(('"', "'")) or key.strip().endswith(('"', "'")):
+        warnings.append("A chave parecia ter aspas extras (removidas).")
+
+    key = key.strip().strip('"').strip("'").replace("\n", "").replace("\r", "")
+
+    if not key:
+        return None, ["OPENAI_API_KEY está vazia após limpeza."]
+    if not key.startswith("sk-"):
+        warnings.append("A chave não começa com 'sk-' — verifique se copiou a chave correta.")
+
+    return key, warnings
+
+
+# NÃO usamos @st.cache_resource aqui de propósito: cache pode reter um cliente
+# criado com uma chave antiga, mascarando atualizações dos Secrets.
+def make_client(api_key: str) -> OpenAI:
+    return OpenAI(api_key=api_key, max_retries=2, timeout=60.0)
+
+
+def verify_credentials(client: OpenAI) -> Tuple[bool, str]:
+    """
+    Faz uma chamada leve para validar a chave de verdade.
+    Retorna (ok, mensagem). Distingue auth de outros erros.
+    """
+    try:
+        client.models.list()
+        return True, "Chave validada com sucesso."
+    except openai.AuthenticationError:
+        return False, ("401 — Chave inválida, expirada ou revogada. "
+                       "Gere uma nova em platform.openai.com e atualize o Secret.")
+    except openai.PermissionDeniedError:
+        return False, ("403 — A chave é válida, mas não tem permissão para este "
+                       "recurso (projeto/organização restritos).")
+    except openai.RateLimitError:
+        return True, ("Chave aceita, porém há limite de uso ou ausência de crédito "
+                      "(verifique billing na OpenAI).")
+    except openai.APIConnectionError:
+        return False, "Falha de conexão com a API da OpenAI. Tente novamente."
+    except Exception as e:  # noqa: BLE001
+        return False, f"Erro inesperado ao validar a chave: {type(e).__name__}: {e}"
+
+
+def humanize_openai_error(e: Exception) -> str:
+    """Converte exceções da OpenAI em mensagens claras para a UI."""
+    if isinstance(e, openai.AuthenticationError):
+        return ("Falha de autenticação (401): a chave foi rejeitada. "
+                "Confira o Secret OPENAI_API_KEY e o billing da conta.")
+    if isinstance(e, openai.PermissionDeniedError):
+        return ("Permissão negada (403): a chave não tem acesso a este modelo/endpoint. "
+                f"Modelo atual: '{CHAT_MODEL}'.")
+    if isinstance(e, openai.NotFoundError):
+        return (f"Modelo não encontrado (404): '{CHAT_MODEL}' não está disponível "
+                "para esta conta. Ajuste CHAT_MODEL.")
+    if isinstance(e, openai.RateLimitError):
+        return ("Limite de uso atingido ou sem crédito (429). "
+                "Verifique billing/limites na OpenAI.")
+    if isinstance(e, openai.APIConnectionError):
+        return "Falha de conexão com a OpenAI. Tente novamente em instantes."
+    if isinstance(e, openai.BadRequestError):
+        return f"Requisição inválida (400): {e}"
+    return f"Erro inesperado: {type(e).__name__}: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -77,23 +162,18 @@ def get_client() -> Optional[OpenAI]:
 # ---------------------------------------------------------------------------
 
 def extract_pdf_pages(file_bytes: bytes) -> List[str]:
-    """Retorna uma lista com o texto de cada página."""
     reader = PdfReader(io.BytesIO(file_bytes))
-    pages = []
-    for page in reader.pages:
-        pages.append(page.extract_text() or "")
-    return pages
+    return [(page.extract_text() or "") for page in reader.pages]
 
 
 def extract_docx_pages(file_bytes: bytes) -> List[str]:
-    """DOCX não tem paginação confiável; tratamos o documento como 'página 1'."""
+    """DOCX não tem paginação confiável; tratamos como 'página 1'."""
     document = docxlib.Document(io.BytesIO(file_bytes))
     text = "\n".join(p.text for p in document.paragraphs if p.text.strip())
     return [text]
 
 
 def extract_pages(uploaded_file) -> List[str]:
-    """Extrai páginas de um arquivo enviado (PDF ou DOCX)."""
     data = uploaded_file.getvalue()
     name = uploaded_file.name.lower()
     if name.endswith(".pdf"):
@@ -129,7 +209,6 @@ class VectorStore:
 
 
 def chunk_pages(contract_name: str, pages: List[str]) -> List[Chunk]:
-    """Divide o texto em blocos com sobreposição, preservando a página de origem."""
     chunks: List[Chunk] = []
     for page_num, page_text in enumerate(pages, start=1):
         text = (page_text or "").strip()
@@ -148,14 +227,11 @@ def chunk_pages(contract_name: str, pages: List[str]) -> List[Chunk]:
 
 
 def embed_texts(client: OpenAI, texts: List[str]) -> np.ndarray:
-    """Gera embeddings em lote e retorna matriz normalizada (para cosseno via IP)."""
+    """Gera embeddings em lote e normaliza (cosseno via produto interno)."""
     vectors: List[List[float]] = []
     batch = 96
     for i in range(0, len(texts), batch):
-        resp = client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=texts[i:i + batch],
-        )
+        resp = client.embeddings.create(model=EMBEDDING_MODEL, input=texts[i:i + batch])
         vectors.extend([d.embedding for d in resp.data])
     arr = np.array(vectors, dtype="float32")
     faiss.normalize_L2(arr)
@@ -163,7 +239,6 @@ def embed_texts(client: OpenAI, texts: List[str]) -> np.ndarray:
 
 
 def build_vector_store(client: OpenAI, chunks: List[Chunk]) -> VectorStore:
-    """Constrói o índice FAISS a partir dos blocos."""
     if not chunks:
         return VectorStore()
     embeddings = embed_texts(client, [c.text for c in chunks])
@@ -173,7 +248,6 @@ def build_vector_store(client: OpenAI, chunks: List[Chunk]) -> VectorStore:
 
 
 def search(client: OpenAI, store: VectorStore, query: str, top_k: int = TOP_K) -> List[Dict[str, Any]]:
-    """Recupera os trechos mais relevantes para a pergunta."""
     q = embed_texts(client, [query])
     scores, idxs = store.index.search(q, min(top_k, len(store.chunks)))
     results = []
@@ -181,21 +255,16 @@ def search(client: OpenAI, store: VectorStore, query: str, top_k: int = TOP_K) -
         if idx < 0:
             continue
         c = store.chunks[idx]
-        results.append({
-            "contract": c.contract,
-            "page": c.page,
-            "text": c.text,
-            "score": float(score),
-        })
+        results.append({"contract": c.contract, "page": c.page,
+                        "text": c.text, "score": float(score)})
     return results
 
 
 # ---------------------------------------------------------------------------
-# Chamadas de IA
+# Chamadas de chat
 # ---------------------------------------------------------------------------
 
-def chat_completion(client: OpenAI, system: str, user: str,
-                    json_mode: bool = False) -> str:
+def chat_completion(client: OpenAI, system: str, user: str, json_mode: bool = False) -> str:
     kwargs: Dict[str, Any] = {
         "model": CHAT_MODEL,
         "messages": [
@@ -221,7 +290,7 @@ e riscos jurídicos decorrentes.
 
 Responda EXCLUSIVAMENTE em JSON válido com a estrutura:
 {
-  "resumo_executivo": "string com uma frase objetiva, ex.: 'Identificadas 14 alterações relevantes entre as versões.'",
+  "resumo_executivo": "frase objetiva, ex.: 'Identificadas 14 alterações relevantes entre as versões.'",
   "total_alteracoes": int,
   "classificacao_risco": "Baixo" | "Médio" | "Alto",
   "justificativa_risco": "string curta",
@@ -239,13 +308,10 @@ Não inclua texto fora do JSON."""
 
 
 def compare_contracts(client: OpenAI, old_text: str, new_text: str) -> Dict[str, Any]:
-    # Limita o tamanho enviado para evitar estouro de contexto em contratos muito longos.
-    limit = 60000
+    limit = 60000  # evita estourar o contexto em contratos muito longos
     user = (
-        "CONTRATO ANTIGO:\n"
-        f"{old_text[:limit]}\n\n"
-        "CONTRATO ATUAL:\n"
-        f"{new_text[:limit]}\n\n"
+        f"CONTRATO ANTIGO:\n{old_text[:limit]}\n\n"
+        f"CONTRATO ATUAL:\n{new_text[:limit]}\n\n"
         "Gere a análise comparativa no formato JSON especificado."
     )
     raw = chat_completion(client, COMPARE_SYSTEM, user, json_mode=True)
@@ -305,10 +371,8 @@ def build_pdf(df: pd.DataFrame, result: Dict[str, Any]) -> bytes:
         Paragraph(result.get("resumo_executivo", ""), normal),
         Spacer(1, 8),
         Paragraph(f"<b>Total de alterações:</b> {result.get('total_alteracoes', len(df))}", normal),
-        Paragraph(
-            f'<b>Classificação de risco:</b> <font color="{risk_color.hexval()}">{risk}</font>',
-            normal,
-        ),
+        Paragraph(f'<b>Classificação de risco:</b> '
+                  f'<font color="{risk_color.hexval()}">{risk}</font>', normal),
         Paragraph(f"<b>Justificativa:</b> {result.get('justificativa_risco', '')}", normal),
         Spacer(1, 16),
         Paragraph("Tabela Comparativa", h2),
@@ -335,7 +399,6 @@ def build_pdf(df: pd.DataFrame, result: Dict[str, Any]) -> bytes:
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f4f8")]),
     ]))
     story.append(table)
-
     doc.build(story)
     return buffer.getvalue()
 
@@ -362,8 +425,7 @@ Não inclua texto fora do JSON."""
 def answer_question(client: OpenAI, store: VectorStore, question: str) -> Dict[str, Any]:
     hits = search(client, store, question)
     context = "\n\n".join(
-        f"[Contrato: {h['contract']} | Página: {h['page']}]\n{h['text']}"
-        for h in hits
+        f"[Contrato: {h['contract']} | Página: {h['page']}]\n{h['text']}" for h in hits
     )
     user = f"CONTEXTO:\n{context}\n\nPERGUNTA: {question}"
     raw = chat_completion(client, CHAT_SYSTEM, user, json_mode=True)
@@ -402,10 +464,17 @@ def render_comparator(client: OpenAI):
         new_file = st.file_uploader("Contrato Atual", type=["pdf", "docx"], key="new")
 
     if st.button("Comparar contratos", type="primary", disabled=not (old_file and new_file)):
-        with st.spinner("Analisando alterações com IA..."):
-            old_text = extract_full_text(old_file)
-            new_text = extract_full_text(new_file)
-            st.session_state.comparison_result = compare_contracts(client, old_text, new_text)
+        try:
+            with st.spinner("Analisando alterações com IA..."):
+                old_text = extract_full_text(old_file)
+                new_text = extract_full_text(new_file)
+                st.session_state.comparison_result = compare_contracts(client, old_text, new_text)
+        except openai.OpenAIError as e:
+            st.error(humanize_openai_error(e))
+            return
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Erro ao processar os documentos: {e}")
+            return
 
     result = st.session_state.comparison_result
     if not result:
@@ -418,8 +487,7 @@ def render_comparator(client: OpenAI):
     c1.metric("Total de alterações", result.get("total_alteracoes", "—"))
     risk = result.get("classificacao_risco", "—")
     c2.metric("Classificação de risco", risk)
-    risk_emoji = {"Baixo": "🟢", "Médio": "🟡", "Alto": "🔴"}.get(risk, "⚪")
-    c3.metric("Nível", risk_emoji)
+    c3.metric("Nível", {"Baixo": "🟢", "Médio": "🟡", "Alto": "🔴"}.get(risk, "⚪"))
     if result.get("justificativa_risco"):
         st.caption(result["justificativa_risco"])
 
@@ -429,18 +497,11 @@ def render_comparator(client: OpenAI):
 
     st.subheader("Downloads")
     d1, d2 = st.columns(2)
-    d1.download_button(
-        "📄 PDF Executivo",
-        data=build_pdf(df, result),
-        file_name="legalglass_resumo_executivo.pdf",
-        mime="application/pdf",
-    )
-    d2.download_button(
-        "📊 Excel Comparativo",
-        data=build_excel(df, result),
-        file_name="legalglass_comparativo.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    d1.download_button("📄 PDF Executivo", data=build_pdf(df, result),
+                       file_name="legalglass_resumo_executivo.pdf", mime="application/pdf")
+    d2.download_button("📊 Excel Comparativo", data=build_excel(df, result),
+                       file_name="legalglass_comparativo.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 # ---------------------------------------------------------------------------
@@ -449,30 +510,33 @@ def render_comparator(client: OpenAI):
 
 def render_chat(client: OpenAI):
     st.header("Módulo 2 — Chat Jurídico Inteligente")
-    st.caption(f"Faça consultas em linguagem natural sobre sua base de contratos (até {MAX_CONTRACTS}).")
+    st.caption(f"Consultas em linguagem natural sobre sua base de contratos (até {MAX_CONTRACTS}).")
 
-    files = st.file_uploader(
-        "Base de contratos (upload múltiplo)",
-        type=["pdf", "docx"],
-        accept_multiple_files=True,
-        key="base",
-    )
+    files = st.file_uploader("Base de contratos (upload múltiplo)", type=["pdf", "docx"],
+                             accept_multiple_files=True, key="base")
 
     if files and len(files) > MAX_CONTRACTS:
         st.warning(f"Limite de {MAX_CONTRACTS} contratos. Foram enviados {len(files)}.")
 
     if st.button("Indexar base", type="primary", disabled=not files):
-        with st.spinner("Extraindo, gerando embeddings e indexando..."):
-            all_chunks: List[Chunk] = []
-            names = []
-            for f in files[:MAX_CONTRACTS]:
-                pages = extract_pages(f)
-                all_chunks.extend(chunk_pages(f.name, pages))
-                names.append(f.name)
-            st.session_state.vector_store = build_vector_store(client, all_chunks)
-            st.session_state.indexed_contracts = names
-        st.success(f"Base indexada: {len(names)} contrato(s), "
-                   f"{len(st.session_state.vector_store.chunks)} blocos.")
+        try:
+            with st.spinner("Extraindo, gerando embeddings e indexando..."):
+                all_chunks: List[Chunk] = []
+                names = []
+                for f in files[:MAX_CONTRACTS]:
+                    pages = extract_pages(f)
+                    all_chunks.extend(chunk_pages(f.name, pages))
+                    names.append(f.name)
+                st.session_state.vector_store = build_vector_store(client, all_chunks)
+                st.session_state.indexed_contracts = names
+            st.success(f"Base indexada: {len(names)} contrato(s), "
+                       f"{len(st.session_state.vector_store.chunks)} blocos.")
+        except openai.OpenAIError as e:
+            st.error(humanize_openai_error(e))
+            return
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Erro ao indexar: {e}")
+            return
 
     if st.session_state.indexed_contracts:
         with st.expander("Contratos na base", expanded=False):
@@ -481,7 +545,6 @@ def render_chat(client: OpenAI):
 
     store = st.session_state.vector_store
 
-    # Histórico
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -497,27 +560,49 @@ def render_chat(client: OpenAI):
             st.markdown(question)
 
         with st.chat_message("assistant"):
-            with st.spinner("Consultando a base..."):
-                ans = answer_question(client, store, question)
+            try:
+                with st.spinner("Consultando a base..."):
+                    ans = answer_question(client, store, question)
+            except openai.OpenAIError as e:
+                msg = humanize_openai_error(e)
+                st.error(msg)
+                st.session_state.chat_history.append({"role": "assistant", "content": msg})
+                return
 
             st.markdown(ans.get("resposta", ""))
-            meta = (
-                f"**Contrato:** {ans.get('contrato', 'N/A')} | "
-                f"**Página:** {ans.get('pagina', 'N/A')} | "
-                f"**Confiança:** {ans.get('confianca', 'N/A')}"
-            )
+            meta = (f"**Contrato:** {ans.get('contrato', 'N/A')} | "
+                    f"**Página:** {ans.get('pagina', 'N/A')} | "
+                    f"**Confiança:** {ans.get('confianca', 'N/A')}")
             st.caption(meta)
             if ans.get("trecho"):
                 with st.expander("Trecho encontrado"):
                     st.write(ans["trecho"])
             with st.expander("Fontes recuperadas"):
                 for h in ans.get("_fontes", []):
-                    st.markdown(f"**{h['contract']}** — p.{h['page']} "
-                                f"(score {h['score']:.2f})")
+                    st.markdown(f"**{h['contract']}** — p.{h['page']} (score {h['score']:.2f})")
                     st.caption(h["text"][:300] + "...")
 
         rendered = ans.get("resposta", "") + "\n\n" + meta
         st.session_state.chat_history.append({"role": "assistant", "content": rendered})
+
+
+# ---------------------------------------------------------------------------
+# Barra lateral de diagnóstico
+# ---------------------------------------------------------------------------
+
+def render_sidebar_diagnostics(key_warnings: List[str], cred_ok: bool, cred_msg: str):
+    st.sidebar.divider()
+    with st.sidebar.expander("🔍 Diagnóstico", expanded=not cred_ok):
+        if cred_ok:
+            st.success(cred_msg)
+        else:
+            st.error(cred_msg)
+        for w in key_warnings:
+            st.warning(w)
+        st.caption(f"Modelo de chat: `{CHAT_MODEL}`")
+        st.caption(f"Embeddings: `{EMBEDDING_MODEL}`")
+        st.caption("Dica: após alterar o Secret, faça Reboot do app "
+                   "(Manage app → ⋮ → Reboot).")
 
 
 # ---------------------------------------------------------------------------
@@ -530,23 +615,38 @@ def main():
     st.sidebar.title("⚖️ LegalGlass AI")
     st.sidebar.caption("Inteligência Artificial para Gestão Contratual e Análise Jurídica")
 
-    client = get_client()
-    if client is None:
-        st.sidebar.error("Chave OpenAI não configurada.")
+    api_key, key_warnings = read_api_key()
+
+    if api_key is None:
         st.title("⚖️ LegalGlass AI")
+        st.error("Chave OpenAI não configurada.")
         st.warning(
-            "Defina a chave da OpenAI em **Streamlit Secrets** para usar a aplicação:\n\n"
-            "```toml\nOPENAI_API_KEY = \"sk-...\"\n```"
+            "Defina a chave em **Settings → Secrets** do Streamlit Cloud:\n\n"
+            "```toml\nOPENAI_API_KEY = \"sk-...\"\n```\n\n"
+            "Sem aspas extras, sem espaços e sem quebra de linha."
         )
+        for w in key_warnings:
+            st.info(w)
         st.stop()
 
-    page = st.sidebar.radio(
-        "Módulos",
-        ["Comparador de Contratos", "Chat Jurídico Inteligente"],
-    )
-    st.sidebar.divider()
-    st.sidebar.caption(f"Modelo: `{CHAT_MODEL}`")
-    st.sidebar.caption(f"Embeddings: `{EMBEDDING_MODEL}`")
+    client = make_client(api_key)
+    cred_ok, cred_msg = verify_credentials(client)
+
+    page = st.sidebar.radio("Módulos", ["Comparador de Contratos", "Chat Jurídico Inteligente"])
+    render_sidebar_diagnostics(key_warnings, cred_ok, cred_msg)
+
+    if not cred_ok:
+        st.title("⚖️ LegalGlass AI")
+        st.error("A credencial da OpenAI foi recusada. Detalhes:")
+        st.warning(cred_msg)
+        st.markdown(
+            "**Como resolver o 401:**\n"
+            "1. Confirme que a chave no Secret está ativa em platform.openai.com.\n"
+            "2. Verifique se a conta tem **billing/crédito** ativo.\n"
+            "3. Cole a chave sem aspas/espaços/quebra de linha.\n"
+            "4. Faça **Reboot** do app após salvar o Secret."
+        )
+        st.stop()
 
     if page == "Comparador de Contratos":
         render_comparator(client)
